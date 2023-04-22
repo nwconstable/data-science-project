@@ -1,0 +1,338 @@
+---
+title: "ProjectStep3"
+author: "Noah Constable"
+date: "4/21/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(arules)
+library(dplyr)
+library(jsonlite)
+library(stringr)
+```
+## Continuing
+When we left off last time we had done a whole bunch of data cleaning and some preliminary analysis. In this chapter we'll prepare the data specifically for use with the `arules` package. This preparation includes categorizing our `steam_super` data frame; it is more helpful to group numeric variables into factors rather than use their specific values.
+
+First, do a few simple filters to eliminate rows that slipped through until now:
+```{r}
+load("steam_super.rdata")
+```
+
+```{r}
+# Remove rows with NA tag values
+steam_super <- steam_super[!is.na(steam_super$tags),]
+# Remove rows with NA names
+steam_super <- steam_super[!is.na(steam_super$name),]
+# Remove rows where the tags value is not NA, but is empty
+steam_super <- steam_super[!steam_super$tags=='[]',]
+# Remove rows with an empty string for the tags value
+steam_super <- steam_super[nchar(steam_super$tags)>0,]
+```
+
+### The Tag Problem
+
+As previously discussed, we have a serious problem with our tag column, and looking at the metacritic and prices columns we see similar issues. I previously said it might be easier to extract as we go, but to use the arules package effectively on the tag data we will need to get everything into a data frame. Lets approach the problem by using a simple example that encompasses some edge cases:
+
+```{r}
+x <- "{'Tactical': 734, \"1990's\": 564, 'e-sports': 550}"
+```
+Here we've defined a variable that contains a typical row's `tags` value. It has three tags- Tactical, 1990's, and e-sports- with 734, 564, and 550 "tags" respectively.
+
+You might notice that the format of the string is awfully similar to JSON. If we can get it to JSON form, we can use the JSON extraction functions we've used before in our data retrieval. R has built-in functions that can help with this! `gsub()` is a child-function of `grep()`, which if you've done much Bashing you'll recognize. Essentially we can give it a string and use regular expressions to find characters to replace!
+
+Here its shown how we can use `gsub()` to replace characters to get the string into JSON format, and then we use the `fromJSON()` function to extract it to a list:
+```{r}
+x <- x %>% gsub("([ {])'", '\\1"', x = .) %>% gsub("':", '":', x = .) %>% fromJSON()
+x
+```
+
+Now that we have a general method, we can extract it to a function that we'll later apply to the entire data frame. To create this data frame though we'll first need the tag names that will become our column names. This function accomplishes that:
+
+```{r}
+ExtractNames <- function(tagVector){
+  namesVector <- vector()
+  for(tags in tagVector){
+    tags <- str_replace_all(tags, "'em ", "em")
+    tags <- str_replace_all(tags, "'Em ", "em")
+    #print(tags)
+    try(
+      x <- tags %>% gsub("([ {])'", '\\1"', x = .) %>% gsub("':", '":', x = .) %>% fromJSON()
+    )
+    namesVector <- c(namesVector, names(x))
+  }
+  namesVector <- unique(namesVector)
+  return(namesVector)
+}
+```
+
+```{r}
+if(file.exists("mynames.rdata")){
+  load("mynames.rdata")
+} else {
+  myNames <- ExtractNames(steam_super$tags)
+  save(myNames, file="mynames.rdata")
+}
+head(myNames)
+```
+
+
+Now we have our column names we can create the data frame:
+
+```{r}
+tagdf <- data.frame(matrix(ncol=length(myNames), nrow=0))
+colnames(tagdf) <- myNames
+```
+
+Next we need the actual tags and their values for each row and insert a new row into the `tagdf` for each row of our `steam_super`:
+
+```{r}
+ExtractTags <- function(df, n = nrow(df)){
+  myNames <- ExtractNames(df$tags[1:n])
+  tagdf <- data.frame(matrix(ncol=length(myNames), nrow=0))
+  colnames(tagdf) <- myNames
+  
+  
+  for(row in 1:n){
+    appid <- df[row,"appid"]
+    tags <- df[row,"tags"]
+    tags <- str_replace_all(tags, "'em ", "em")
+    tags <- str_replace_all(tags, "'Em ", "em")
+    try(
+      x <- tags %>% gsub("([ {])'", '\\1"', x = .) %>% gsub("':", '":', x = .) %>% fromJSON()
+    )
+    tagdf[row,] <- NA
+    for(item in 1:length(x)){
+      tagdf[row,names(x)[item]] = x[[item]]
+    }
+  }
+  return(tagdf)
+}
+```
+
+Takes forever so try this instead of just running it every time:
+```{r}
+if(file.exists("tagdf.rdata")){
+  load("tagdf.rdata")
+} else {
+  tagdf <- ExtractTags(steam_super)
+  save(tagdf, file="tagdf.rdata")
+}
+```
+
+
+```{r}
+tagdf[1,1:5]
+```
+Here I'm showing the first row and first five columns (there are 371).
+
+Remember our goal with the tags was to find any possible associations that might exist between tag counts and owner group sizes. Since we added rows to `tagdf` in the same order they appear in `steam_super`, we can basically copy that entire column with no manipulation. Remember, we want the owners column as characters representing a range to find useful associations between tags and sizes, and we don't necessarily care about an 'exact' amount of owners:
+
+```{r}
+tagdf[,"owners"] <- steam_super$owners
+```
+
+Lets try it out. To use get any useful information from arules we need to create a set of 'transactions' that the `apriori()` function can understand. Luckily, its as simple as running `transactions()` on the data frame, although we do need to drop a couple problematic columns. These columns represent tags that appear so infrequently that arules thinks there are only two levels to the variable. 
+
+```{r}
+#There are a lot of warnings for this
+options(warn = -1)
+# Drop problematic columns
+dropCols <- c("VR Only", "Feature Film")
+tagdf <- tagdf[,!names(tagdf) %in% dropCols]
+# Create transactions from data frame
+tagsactions <- transactions(tagdf)
+# Create ruleset with support greater than 0.1 (10%) and confidence >= 50%
+tag.rules <- apriori(tagsactions, parameter = list(supp = 0.1, conf = 0.5))
+# arules has support for turning a ruleset into a dataframe with the `DATAFRAME()` function
+tag.rules.df <- DATAFRAME(tag.rules)
+inspect(tag.rules)
+```
+
+I should take this opportunity to expand on what we're really doing here. The `arules` package was created to find associations between variables in a format resembling "x => y", which can be read as "if x, then y" or "x implies y". Here, x can only ever be one variable, but y can be a set of any number of variables, and in the output above the x is referred to as the "Left Hand Side" (LHS) and the y is the "Right Hand Side" (RHS). These associations are called rules and every rule has some amount of support, showing how much that rule appears. There is also a measure of confidence, coverage, and lift. Lift here means that one rule affects some other rule to some degree. A higher lift means it is more impactful. 
+You can think about it like this: if you are grocery shopping and you buy some cereal, you are also likely to buy milk to use with the cereal (assuming you don't have any at home). This would be represented by the rule "cereal => milk". To exploit this rule, a grocery store manager might but the two sections closer together or offer deals that encourage buying both together. 
+What we see in this output are the rules generated from the tag data frame. For example, the first one seems to be "{} => {owners=0 .. 20,000}". This shows that there are so many values of "0 .. 20,000" for the variable `owners` that it has picked it up as a rule, with a support of 0.68, meaning about 68% of our items have 0-20,000 owners. It looks like our most significant rules are 14 and 15:
+```{r}
+tag.rules.df[14:15,]
+```
+
+These rules tell us that there may be a correlaton between games with high amounts of adventure and indie tags and low owner counts. There is not a lot of support for these rules, however we may still hypothesize. The prevelance of these rules and others like them might imply that the adventure adn indie tags are very common and usually these types of games have low player counts. Intuitively this also makes sense, as for every major AAA game with millions of players, there are hundreds if not thousands of small games made by small teams that see almost no success. 
+Again, this is just hypothesizing and much more testing would need to be done to confirm these. The `arules` package is very good at doing a quick analysis and being able to pick out interesting rules to further pursue.
+
+### Analyzing steam_super
+Now that we have this experience under our belt, lets extend it to the grand `steam_super` table. First thing, there are tons of columns in the `steam_super` table that we either don't really care about, are unique, or don't really tell us anything valuable, such as the "detaild_description" column. If we were lisitng this game on our store we would certainly care about that, but as it is right now every column is going to be unique so there won't be any interesting rules found from them. If we were to transform it somehow like we did with the tag column maybe we could find some sort of trend of 'buzz words', but we'll just avoid it entirely for now.
+
+Here we are filtering out rows we don't really care about right now and creating a new data frame. This preserves our initial `steam_super` table.
+```{r}
+dropCols <- c("dlc", "detailed_description", "about_the_game", "short_description", "fullgame", "platforms", "reviews", "release_date", "content_descriptors", "developers", "publishers", "score_rank", "userscore", "tags", "price_overview", "categories", "genres", "initialprice", "discount", "average_forever", "average_2weeks", "median_forever", "median_2weeks", "ccu", "mids", "type", "is_free")
+steam_super_2 <- steam_super[,!names(steam_super) %in% dropCols]
+
+```
+
+From my understanding of the `arules` package, all of our data needs to either be a table with integers representing frequency and very few 'identifying' columns (tagdf), or entirely character, preferably with levels. We will have to do some manipulations to this end, and we'll start with the `appid` column. This we will simply convert to characters and replace the numeric version. An argument could be made that this isn't necessary, but I don't want `arules` to think there is any correlation between the seemingly arbitrary id number the Steam store gives a game and its success.
+```{r}
+charappids <- as.character(steam_super_2[,"appid"])
+steam_super_2 <- steam_super_2[,!names(steam_super_2) %in% c("appid")]
+steam_super_2[,"appid"] <- charappids
+```
+
+Next we'll convert the metacritic column into a useful form. Right now it is both in that weird JSON-like form and the rating is represented as an integer. We'll convert it to just the integers first, then group the ratings and assign each game its rating as represented by those groups.
+
+```{r}
+# Takes the list of metacritic ratings and returns a vector of the numeric values
+ConvertMetacritic <- function(metacritic){
+  # Create empty return vector
+  returnVec <- numeric()
+  # Create indexing variable
+  i = 1
+  # For each value in the metacritic list...
+  for(meta in metacritic){
+    # If that value isn't empty...
+    if(nchar(meta)>0){
+      # Use a regex lookbehind to extract the integer rating and convert it to numeric, then put it in the return vector at index i
+      returnVec[i] <- as.numeric(str_extract(meta, regex("(?<='score': )\\d+")))
+    } else {
+      # Otherwise put a -1 in that variables spot representing no rating
+      returnVec[i] <- -1
+    }
+    # Increment the indexing variable
+    i <- i + 1
+  }
+  # Return the vector of numeric ratings
+  return(returnVec)
+}
+```
+
+Easy-peasy! Now we just need to run this to extract the ratings. Then we'll use the R `cut()` function to factorize the values based on the ranges they fall in and insert those levels into the `steam_super_2` metacritic column.
+
+Converting and labeling Metacritic scores to factors
+```{r}
+metacritic <- ConvertMetacritic(steam_super_2[,"metacritic"])
+#head(metacritic)
+steam_super_2[["metacritic"]] <- ordered(cut(metacritic, c(-2, 0, 20, 40, 60, 80, 100)), labels = c("Not Rated", "Very Poor", "Poor", "Average", "Good", "Very Good"))
+head(steam_super_2[["metacritic"]])
+```
+
+Next we'll tackle the user ratings. These are the 'positive' and 'negative' column in `steam_super`. Naturally, the way Steam handles ratings, and the way most companies handle ratings, leads to inaccurate conclusions. This is explained a lot more (in this article)[https://www.evanmiller.org/how-not-to-sort-by-average-rating.html]. This gist of it is that if we take the simple difference of scores we end up with inaccurate summaries. For example, if a huge game has 1000 positive ratings and 995 negative ratings, the difference is 5. If a tiny game has 5 positive ratings and 0 negative ones, the difference is also 5. We know that because of the first game's size that it really is a mixed reception, and that the second game is relatively much better received. We need a way to factor in the amount of reviews with the positive and negative ones to accurately describe it.
+The following is a statistical way of doing so that, rather than giving us the actuall score, gives us a *probability* telling us how likely it is to be rated well. Again, check out the linked article because it is explained much better there. Here is the R implementation of that:
+
+(Accurate Ratings)[https://www.evanmiller.org/how-not-to-sort-by-average-rating.html]
+```{r}
+ci_lower_bound <- function(pos, n, confidence = 0.95) {
+  if (n == 0) {
+    return(0)
+  }
+  z <- qnorm(1 - (1 - confidence)/2)
+  phat <- 1.0 * pos/n
+  (phat + z^2/(2*n) - z * sqrt((phat*(1-phat)+z^2/(4*n))/n))/(1+z^2/n)
+}
+
+FixRatings <- function(ss){
+  returnVec = numeric()
+  i = 1
+  for(row in 1:nrow(ss)){
+    pos = ss[row,"positive"]
+    n = pos + ss[row,"negative"]
+    returnVec[i] = ci_lower_bound(pos, n)
+    i = i + 1
+  }
+  return(returnVec)
+}
+```
+
+```{r}
+ratings <- FixRatings(steam_super_2)
+head(ratings)
+```
+
+As you can see we only have values ranging from 0-1 as these are not ratings but probabilities. We can, however, turn these into factors all the same:
+
+```{r}
+steam_super_2[["rating_intervals"]] <- ordered(cut(ratings, c(0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.99)), labels = c("0-20%", "20%-40%", "40%-60%", "60%-80%", "80%-90%", "90%-95%", "95%-99%")) 
+```
+
+Since we've dealt with these columns we no longer need them and can drop them:
+
+```{r}
+dropCols <- c("positive", "negative")
+steam_super_2 <- steam_super_2[,!names(steam_super_2) %in% dropCols]
+```
+
+Now we'll continue to use `cut()` to transform columns as we see fit, starting with the `price` column. We'll group these into arbitrarily chosen price ranges:
+```{r}
+steam_super_2[["fixed_prices"]] <- ordered(cut(steam_super_2[["price"]], c(-Inf,0,500,1500,3000,4500,6000,8000,12000,60000)), labels = c("Free", "0-$5", "$5-$15", "$15-$30", "$30-$45", "$45-$60", "$60-$80", "$80+", "$120+"))
+```
+
+And after every `cut()` we'll drop the old column we no longer need:
+
+```{r}
+dropCols <- "price"
+steam_super_2 <- steam_super_2[,!names(steam_super_2) %in% dropCols]
+```
+
+Classifying the most frequent tag on a game:
+
+```{r}
+steam_super_2[["bigtags"]] <- ordered(cut(steam_super_2[["bigtags"]], c(0,21, 22, 26, 33, 50, 810, 25176)), labels = c("Lower-Low Tags", "Upper-Low Tags", "Lower-Mid Tags", "Upper-Mid Tags", "Lower-High Tags", "Upper-High Tags", "Top 1% Tags"))
+```
+
+Finally we can throw the transformed data frame at arules and see if we find anything useful! Because we have more data (and because I've tinkered with this already) I'm setting the support parameter to 0.1, meaning we'll see rules that apply to at least 10% of the data, and the confidence parameter much higher:
+
+```{r}
+if(file.exists("steam.rules.rdata")){
+  load("steam.rules.rdata")
+} else {
+  options(warn = -1)
+  steam.transactions <- transactions(steam_super_2)
+  steam.rules <- apriori(steam.transactions, parameter = list(support = 0.1, confidence = 0.95))
+  save(steam.rules, file="steam.rules.rdata")
+}
+
+steam.rules.df <- DATAFRAME(steam.rules)
+head(steam.rules.df[order(steam.rules.df$support, decreasing = T),])
+```
+
+Here I've just shown the five rules with the most support. These rules aren't very interesting though because they really only tell us that a lot of games don't have a metacritic review. This isn't exactly an epiphany, and doesn't tell us anything useful. Lets try removing rows with a "Not Rated" value for their metacritic and try again to see if we find anything interesting.
+
+```{r}
+if(file.exists("steam.rules.no.meta.rdata")){
+  load("steam.rules.no.meta.rdata")
+} else {
+  options(warn = -1)
+  # select() is a dplyr function that helps filter information, here we pipe the data frame to it
+  steam.transactions.2 <- steam_super_2 %>% select(!metacritic) %>% transactions()
+  steam.rules.no.metacritic <- apriori(steam.transactions.2, parameter = list(support = 0.005, confidence = 0.95))
+  save(steam.rules.no.metacritic, file="steam.rules.no.meta.rdata")
+}
+
+steam.rules.no.metacritic.df <- DATAFRAME(steam.rules.no.metacritic)
+head(steam.rules.no.metacritic.df[order(steam.rules.no.metacritic.df$support, decreasing = T),])
+```
+
+Now we have some more interesting data. We had to lower the support value because even our most prevelant rule only has a support of 0.19, or 19%. This rule also tells us that if a game has the lowest category of tags it has between 0-20,000 tags. Inutitively that makes sense, as the less owners a game has the less people there are to tag it. Our second rule is also not that great, using the same low-low tags rule in combination with the language being English. It seems our most supported rules all seem to apply to games with low amounts of owners and aren't telling us much. What if we filtered out games with 0-20,000 owners? Would we see any more interesting rules?
+
+```{r}
+if(file.exists("steam.high.owners.rules.rdata")){
+  load("steam.high.owners.rules.rdata")
+} else {
+  options(warn = -1)
+  steam.high.owners.transactions = steam_super_2 %>% select(!metacritic) %>% filter(!(owners == "0 .. 20,000")) %>% transactions()
+  steam.high.owner.rules = steam.high.owners.transactions %>% apriori(parameter = list(support = 0.005, confidence = 0.9))
+  save(steam.high.owner.rules, file="steam.high.owners.rules.rdata")
+}
+
+steam.high.owner.rules.df = DATAFRAME(steam.high.owner.rules)
+head(steam.high.owner.rules.df[order(steam.high.owner.rules.df$support, decreasing = T),])
+```
+
+These are slightly more interesting, but again it seems pretty caught on the relationships between owner size and tag counts when we'd probably prefer information about relationships with the owners or tags on the right and other information on the left. However, we can still find some information from these. For example, it seems moderately large games with a mid price range have some of the most tags, perhaps indicative of a dedicated playerbase. Very large games with high ratings also have lots of tags. Jumping ahead, there seems to be support that smaller playerbases with less tags (whcih would normally be pretty correlated) usually have lower prices (but not free).
+All of this to say, we still don't know the ingredients to a perfect, wildly successful game. Although, we have discovered plenty of rules that describe how to create a small and unsuccessful game. Perhaps the key here is to extract from *missing* data. Think about it like this: `arules` finds patterns and describes those patterns in terms of the elements that make them and their prevelance. If it cannot find patterns that all large games follow, perhaps there *aren't* any. One, not I, could hypothesize that the key to successful games is uniqueness. In this case, an analysis like this wouldn't be able to find or prove it.
+
+## Conclusions
+
+What a journey. It seems that not that long ago we were still polling APIs and discovering the awful return data. We transformed that data into useable formats and organized it so that it suited our specific needs. We then applied machine learning from the `arules` package to find patterns and rules that describe our data. Although we didn't necessarily find any useful or revolutionary relationships, we did lay the ground work and could examine the data further. We've come a long way and learned about R, data wrangling, and one data analysis package, `arules`. 
+
+
