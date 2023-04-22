@@ -1,0 +1,407 @@
+---
+title: "Project Step 1"
+author: "Noah Constable"
+date: "2/22/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Purpose
+
+I plan to gather data from the SteamSpy and Steamworks APIs about the games that appear on the Steam store. This will allow me to analyze and (hopefully) gain some insights as to what makes game popular or successful, especially pertaining to genres (but some other interesting variables may pop up). I'm doing this because although I like video games, I find myself playing within the same genre and would like to see what's going on with the rest of the world, per se.
+
+## Data Details
+
+To do this I will gather data from the previously mentioned APIs. These are mostly public, and deliver data in JSON format. Getting the data from JSON to a usable format will probably require the most effort. To gather information from the Steam and SteamSpy APIs, we will need the `appid`s of each game. We can gather these from the SteamSpy API, then use them to get other information for each game. We will have many variables, including `type` (which should always be a character set of 'game'), `name` (char), `steam_appid` (int), `genres` (dependent on data set, chars for SteamSpy, data frame of chars and corresponding genre ids as char), `realease_date` (data frame of boolean indicating whether it is 'coming soon' and char set for release date), `owners`, the number of `positive` and `negative` ratings, and `average_forever` players. Most of these are pretty straightforward, and we've talked about what the `appid`s are already. There will be many different types, including nums, characters, and logicals. There will also be NA's. We get 1,000 `appid`s from the SteamSpy query so we *should* get 1,000 results (from each API).
+
+Below I've included a table of variables-of-interest and their corresponding data format:
+
+Steam Data Variables:
+
+| Variable                | Data Type                                                         |
+|-------------------------|-------------------------------------------------------------------|
+|   type                  | character                                                         |
+| steam_appid             | integer                                                           |
+| developers              | character                                                         |
+| price_overview          | list of ints and chars                                            |
+| initial (part of price) | integer                                                           |
+| categories              | characters                                                        |
+| genre                   | characters                                                        | 
+| release_date            | characters                                                        | 
+
+SteamSpy Data Variables:
+
+| Variable  | Data Type  |
+|-----------|------------|
+|   appid   | integer    |
+| name      | characters |
+| developer | characters |
+| owners    | characters (because the range of possible owners is so large, its represented as a range rather than just an int) |
+| genre     | characters |
+| tags      | characters |
+
+## Data Acquisition
+
+Below we will delve into the process of getting and transforming the data from the APIs to a usable format.
+
+### Libraries
+
+First we will need some libraries to handle interacting with APIs with R. From some research, `httr` and `jsonlite` should be able to do this.
+```{r, echo=FALSE}
+#install.packages(c("httr", "jsonlite"))
+library('httr')
+library('jsonlite')
+library('tidyverse')
+library('tibble')
+```
+
+### Importing Data
+
+Next we need to actually get the data. However, by 'data' I really mean the appid's of store items. There are tons of things in the Steam store that have an appid but are not games in the sense that we want them. First, we must query the SteamSpy API with a request of `all`, which will return a JSON object containing all appid's. This will be our starting point. 
+
+```{r}
+url = "https://steamspy.com/api.php?request=all"
+appIdsJson = GET(url)
+```
+
+Now we have an object that looks like this:
+![appids image](./Images/appidsjson.png)
+You'll notice that the `content` variable, which is what contains all of our appid's, is in the `raw` format. We can use the `rawToChar()` function to convert it and extract it from the JSON with `fromJSON()`:
+
+```{r}
+appids = appIdsJson$content %>% rawToChar() %>% fromJSON()
+```
+
+Create the vectors (that will eventually be our columns) for appids and names:
+```{r}
+.f = function(r,var="appid"){r[[var]]}
+vappids <- sapply(appids, .f)
+vappnames <- sapply(appids, .f, var="name")
+```
+
+Below are multiple failed attempts at writing functions to more efficiently query the SteamSpy API for as many appid's as possible, taking into account the polling limit. Unfortunately, I could not manage to get these to quite work.
+```{r, eval=FALSE}
+url = "https://steamspy.com/api.php?request=all&page="
+
+CheckID <- function(value, vector1){
+  if(any(vector1==value)) {
+    return(TRUE)
+  }
+  return(FALSE)
+}
+
+function(r,var="appid"){r[[var]]}
+
+getIDs <- function(){
+  noDups <- TRUE
+  inc <- 0
+  while(inc < 25){
+    print("Polling")
+    inc <- (inc+1)
+    appIdsJson <- GET(url)
+    appids <- appIdsJson$content %>% rawToChar() %>% fromJSON()
+    temp <- sapply(appids, .f)
+    noDups <- sapply(temp, CheckID, vector1 = vappids)
+    if(any(noDups==FALSE)) {
+      noDups <- FALSE
+    } else {
+      noDups <- TRUE
+    }
+    if(noDups){
+      print("No Duplicates Found, Updating")
+      vappids <- c(vappids, temp)
+      temp <- sapply(appids, .f, var="name")
+      vappnames <- c(vappnames, temp)
+      head(vappids)
+    }
+    print("Waiting")
+    Sys.sleep(61)
+  }
+  print("Exiting")
+}
+
+getIDs2 <- function(page=0){
+  url = "https://steamspy.com/api.php?request=all&page="
+  newUrl = paste(url, page, sep = "")
+  print(paste("Requesting page:", newUrl))
+  appIdsJson = GET(newUrl)
+  appids = appIdsJson$content %>% rawToChar() %>% fromJSON()
+  temp = sapply(appids, .f)
+  print("New temp:")
+  head(temp)
+  vappids = c(vappids, temp)
+  print("App ids updated")
+  temp = sapply(appids, .f, var="name")
+  print("New temp:")
+  head(temp)
+  vappnames = c(vappnames, temp)
+  print("App names updated")
+  if(page <= 25){
+    print("Waiting for polling to refresh")
+    Sys.sleep(61)
+    getIDs2(page=page+1)
+  }
+  print("Exiting")
+}
+```
+
+Regardless, lets take a look at what we *do* have:
+```{r}
+head(vappids)
+head(vappnames)
+```
+
+Alright, lets throw this stuff into one dataframe:
+```{r}
+appsdf <- data.frame(vappids, vappnames, row.names = NULL)
+head(appsdf)
+```
+
+Now we can download the data from the Steam store. The function below, while not perfect and having tons of room for improvement, queries the SteamAPI for each id in the supplied vector (in this case, appsdf$vappids). To account for the SteamAPI's maximum polling rate, the requests are split into multiple 'buckets' and have a timer of 5 minutes between buckets.
+```{r, results='hide'}
+url <- "http://store.steampowered.com/api/appdetails/?appids="
+SteamDownload <- function(vector){
+  # Define a bucket, starting i, and empty vectors we'll use later
+  # These are due to the SteamAPIs polling rate, which flags
+  # an IP and returns a 429 if more than 200 requests are made every 5 minutes.
+  bucket = 1
+  i = 1
+  dat <- c()
+  temp <- c()
+  #For 5 buckets, we retrieve 200 elements
+  while(bucket < 6) {
+    print(paste("Retrieving Bucket:", bucket))
+    for(i in i:(i+200)){
+      # R's crude ternary operator, checking if we're above the maximum, could also be placed directly in the `for`
+      i = ifelse(i>(200*bucket), (200*bucket), i)
+      print(paste("i is:", i))
+      #Get the appid from the Steam store API
+      tempDat <- GET(paste0(url, vector[i]))
+      #Check that the status code is good
+      if(tempDat$status_code==200){
+        #Join the old list with the new data
+        temp <- c(temp, tempDat)
+      } else {
+        print(paste("Error! Code:", tempDat$status_code))
+        break
+      }
+    }
+    print("Data retrieved")
+    dat <- c(dat, temp)
+    bucket = bucket+1
+    #Only have to do this stuff if we're not on the last bucket
+    if(bucket<5){
+      print(paste("New Bucket:", bucket))
+      print("Sleeping")
+      Sys.sleep(300)
+    }
+  }
+  return(dat)
+}
+#steamdownload <- sapply(appsdf$vappids, SteamDownload)
+#results=list()
+#for(id in appsdf$vappids){
+  #if(!id%in%names(results)){
+    #results[[id]]=SteamDownload(id)
+  #}
+#}
+```
+
+
+```{r, eval=F}
+steamdownload <- SteamDownload(appsdf$vappids)
+```
+![Steam Download](./Images/steamreply.png)
+```{r,eval=FALSE}
+save(steamdownload,file="steamdownload2.rdata")
+```
+
+```{r}
+load("steamdownload2.rdata")
+```
+This gives us a (very wide) one-dimensional list with the content we need sprinkled throughout. We can extract the data like this:
+
+```{r,eval=F}
+contents=steamdownload[6+0:3090*10]
+```
+This extracts the 'content' variable, but since there are *thousands* of this variable with the same name we need each one. They are all equidistant from each other- the 6th entry for every 10 entries. This code essentially gets each of these (the 6th variable, and every 10th one after that, e.g. 6, 16, 26, etc).
+
+Here we define a simple function to transform the huge object of JSON returns from our 'GET' into a list form:
+```{r, results='hide'}
+ConvertSteamData <- function(v) {
+  #Define null vector
+  tmp <- NULL
+  #For every element in the supplied vector (hopefully something that looks like `contents`)
+  for(i in 1:(length(v))){
+    #Place the decoded data into the matching place in tmp
+    tmp[i] <- fromJSON(rawToChar(v[[i]]))
+  }
+  #Return tmp
+  return(tmp)
+}
+```
+
+```{r, eval=F}
+# Don't ask about steamData1
+steamData2 <- ConvertSteamData(contents)
+```
+
+```{r, eval=F}
+save(steamData2, file = "steamData.rdata")
+```
+
+```{r}
+load("steamData.rdata")
+```
+
+
+Now we finally have the data in a somewhat-readable format. By accessing the 'data' variable of each entry we can see more information about it, such as the name, if it's free, the developers, etc. Converting this into a dataframe, while useful, would tak more effort than it may be worth. Below is some non-functional code *(read: a boneyard)* attempting to tackle this. 
+
+```{r, eval=FALSE}
+steamColumns <- c('type', 'name', 'steam_appid', 'required_age', 'is_free', 'controller_support', 'dlc', 'detailed_description', 'about_the_game', 'short_description', 'fullgame', 'supported_languages', 'header_image', 'website', 'pc_requirements', 'mac_requirements', 'linux_requirements', 'legal_notice', 'drm_notice', 'ext_user_account_notice', 'developers', 'publishers', 'demos', 'price_overview', 'packages', 'package_groups', 'platforms', 'metacritic', 'reviews', 'categories', 'genres', 'screenshots', 'movies', 'recommendations', 'achievements', 'release_date', 'support_info', 'background', 'content_descriptors')
+
+
+SteamToDF <- function(list){
+  colNames = list[[1]]$data %>% names()
+  
+  results=data.frame(colnames=steamColumns)
+  #tmp <- data.frame(NULL)
+  
+  for(i in 1:length(v)){
+     results=rbind(results,v[[i]]$data[SteamColumns])
+   # tmp[i,] <- as.data.frame(do.call(cbind, v[[i]]$data))
+  }
+  return(tmp)
+}
+
+
+```
+
+For our last trick, we will retrieve data on the same games from the SteamSpy API. This may seem redundant, but this API will give us informtion the normal Steam API will not, such as approximately how many owners a game has. This information may be useful later in our data exploration phase.
+```{r, eval=FALSE}
+SpyList <- function(list){
+  url = "https://steamspy.com/api.php?request=appdetails&appid="
+  tmpList <- list(NULL)
+  len = length(list)
+  
+  for(i in 1:len){
+    appid = list[[i]]$data$steam_appid
+    tempData <- GET(paste0(url, appid))
+    if(!tempData$status_code==200){
+      print(paste0("Error on item: ", i, "\nError code: ", tempData$status_code))
+    } else {
+      tmpList[[i]] <- fromJSON(rawToChar(tempData$content))
+    }
+    Sys.sleep(1)
+  }
+  return(tmpList)
+}
+```
+
+```{r, eval=FALSE}
+steamSpyData <- SpyList(steamData2)
+```
+
+![steamspy image](./Images/steamspylist.png)
+
+
+```{r, eval=F}
+save(steamSpyData, file = "SteamSpyData.rdata")
+```
+```{r}
+load("SteamSpyData.rdata")
+```
+
+Now we finally have our data. Remember, we got this data from three sources:
+First we asked the SteamSpy API for as many `appid`'s as we could for games on the Steam store.
+Then we asked the Steam store for data on each of those games using the `appid`'s.
+Finally we also asked SteamSpy for more information about each `appid`.
+This has given us tons of information that may, or may not be useful. It is also a smaller set of data. In fact, someone has conveniently already done most of this data gathering, and [posted the uncleaned CSV's](https://www.kaggle.com/datasets/nikdavis/steam-store-raw). Because everything is already in CSV's, we can easily read them into data frames, and since there are vastly more observations in these, we will use these for the remainder of this project.
+While the experience in gathering and wrangling data is important, so is my sanity.
+
+```{r}
+app_id_list <- read.csv("app_list.csv", header = TRUE)
+steam_app_data <- read.csv("steam_app_data.csv", header = TRUE)
+steamspy_data <- read.csv("steamspy_data.csv", header = TRUE)
+```
+
+I'm not showing the `head()` or `str()` of either the steam_app_data or steamspy_data because they are too large with too many variables, but I will include the count of rows and columns in each:
+```{r}
+head(app_id_list, 5)
+paste0("Rows: ", nrow(steam_app_data)," Columns: ", ncol(steam_app_data))
+paste0("Rows: ", nrow(steamspy_data)," Columns: ", ncol(steamspy_data))
+```
+
+
+More non-functional code attempting to download and frame the data:
+```{r, eval=F}
+#cols <- c("appid", "name", "developer", "publisher", "score_rank", "positive", "negative", "owners", "price", "initialprice", )
+
+SpyFrame <- function(list){
+  library('tibble')
+  url = "https://steamspy.com/api.php?request=appdetails&appid="
+  tmp <- data.frame(NA)
+  names <- NULL
+  len = 5 #length(list)
+  
+  for(i in 1:len){
+    appid = list[[i]]$data$steam_appid
+    td <- GET(paste0(url, appid))
+    names <- c(names, td$content %>% rawToChar() %>% fromJSON() %>% names())
+    Sys.sleep(1)
+  }
+  
+  names <- unique(names)
+  
+  for(names in names) {
+    tmp[names] = NA
+  }
+  tmp = tmp[-1]
+  
+  for(i in 1:len){
+    appid = list[[i]]$data$steam_appid
+    td <- GET(paste0(url, appid))
+    
+    if(!td$status_code==200){
+      print(paste0("Error at i = ", i, ". Error code: ", td$status_code))
+    } else {
+      new_row = td$content %>% rawToChar() %>% fromJSON()
+      rowNum = nrow(tmp)+1
+      for(names in colnames(tmp)){
+        rowNum = nrow(tmp)+1
+        tmp[rowNum, names] = ifelse(names %in% names(new_row), new_row$names, NA)
+      }
+      #new_row = td$content %>% rawToChar() %>% fromJSON() %>% as.data.frame()
+      #tmp = tmp %>% add_row(new_row)
+    }
+    
+    Sys.sleep(1)
+  }
+  
+  return(tmp)
+}
+```
+
+```{r, eval=F}
+steamSpyData <- SpyFrame(steamData2)
+```
+These were ways I was attempting to add each new row to the data frame, assuming the data frame had all potential tags as columns and inserting 'NA' if the new row didn't have values for that column (tag).
+```{r,eval=F}
+for(names in names(new_row)){
+  rowNum = nrow(tmp)+1
+  if(match(names, colnames(tmp), nomatch = 1337) != 1337){
+    tmp[rowNum, names] = new_row$names
+  }
+}
+```
+
+```{r,eval=F}
+rowNum = nrow(tmp)+1
+for(names in colnames(tmp)){
+  tmp[rowNum, names] = ifelse(names %in% names(new_row), new_row$names, NA)
+}
+```
+

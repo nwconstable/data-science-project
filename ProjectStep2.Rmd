@@ -1,0 +1,263 @@
+---
+title: "ProjectStep2"
+author: "Noah Constable"
+date: "3/3/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Reminder of Goals
+
+We initially set out to garner some information about games on the Steam store, particularly if there are any interesting relationships between tags/genres and price/ownership. Figuring out how to query the APIs and get the information we need created a lot of issues, and we ended up with two data files containing varying information. For example, data from the Steam store API includes things you would find on a store listing: header_image, screenshots, prices, etc. Data from the SteamSpy API gives us more *player-oriented* data: (range of number of) owners, positive and negative ratings, and genre. Since setting out on this journey, I have also acquired some skills analyzing text data. Because of this, we may be able to add the `detailed_description`s of each game to our analysis.
+
+
+##The Data
+
+```{r}
+library(jsonlite)
+library(stringr)
+app_id_list <- read.csv("app_list.csv", header = TRUE)
+steam_app_data <- read.csv("steam_app_data.csv", header = TRUE)
+steamspy_data <- read.csv("steamspy_data.csv", header = TRUE)
+```
+
+
+Just to show, here are the column names of what is contained in the data obtained from the Steam store:
+```{r}
+names(steam_app_data)
+```
+
+And the names of the SteamSpy data:
+```{r}
+names(steamspy_data)
+```
+
+You can see there are some overlapping columns, and we can use some, such as the `appid` to join tables, or just to gather information about the same game from both. Joining would create a very large and nice table, with everything we (theoretically) need in it, and poses more of a challenge so lets attempt that. First lets look at the tables we have:
+```{r}
+nrow(steam_app_data)
+nrow(steamspy_data)
+table1ids = unique(steam_app_data$steam_appid)
+table2ids = unique(steamspy_data$appid)
+commonids = intersect(table1ids, table2ids)
+length(commonids)
+```
+This tells us that of the 28,992 rows in the SteamSpy table and the 29,235 rows in the Steam table, 28,984 are referencing the same game. I also wonder if we have any repeated elements. We can check using the `rle` command, or 'run length encoding':
+```{r}
+repeats = rle(sort(steamspy_data$appid))
+table(repeats$lengths)
+repeats = rle(sort(steam_app_data$steam_appid))
+table(repeats$lengths)
+```
+This shows us that in the `steam_app_data` table there are a small number of repeated values. We can extract the appids of the *repeat offenders* like such:
+
+```{r}
+repeatids = repeats$values[which(repeats$lengths>1)]
+repeatids
+```
+
+We can remove all duplicated rows pretty easily:
+```{r}
+steam_app_data = steam_app_data[!duplicated(steam_app_data),]
+```
+
+And checking again:
+```{r}
+repeats = rle(sort(steam_app_data$steam_appid))
+table(repeats$lengths)
+```
+Good! Now we don't have any duplicated rows. We can now try to combine the two tables into one giant super table, and after that we'll decide which columns to drop. `merge` can do this pretty easily for us, but since we are specifying that we want the tables *merged* by appid, we need the 'steam_appid' column to be named 'appid'.
+
+```{r}
+colnames(steam_app_data)[3] = "appid"
+steam_super = merge(x=steam_app_data, y=steamspy_data, by="appid", all = TRUE)
+```
+
+Nice, lets take a look at 'steam_super':
+```{r}
+names(steam_super)
+nrow(steam_super)
+```
+```{r}
+repeats = rle(sort(steam_super$appid))
+table(repeats$lengths)
+```
+Thats good and all, but we still have a lot of information we don't necessarily need, such as 'mac_requirements', and we have two 'name' variables when we only need one. Lets clean it up a little:
+```{r}
+drop <- c("required_age", "controller_support", "supported_languages", "header_image", "website", "pc_requirements", "mac_requirements", "linux_requirements", "legal_notice", "drm_notice", "ext_user_account_notice", "demos", "packages", "package_groups", "screenshots", "movies", "recommendations", "achievements", "support_info", "background", "name.y")
+steam_super <- steam_super[,!names(steam_super) %in% drop]
+colnames(steam_super)[3] = "name"
+```
+
+That seemed to complete without error, lets check our new data frame:
+```{r}
+names(steam_super)
+ncol(steam_super)
+nrow(steam_super)
+```
+This is much more manageable, and we can always re-obtain those columns we dropped from the initial data sets.
+We do still have multiple rows with NA values for either the tags or names, and since these are pretty important pieces of information we'll drop these rows.
+
+```{r}
+steam_super <- steam_super[!is.na(steam_super$tags),]
+steam_super <- steam_super[!is.na(steam_super$name),]
+steam_super <- steam_super[!steam_super$tags=='[]',]
+nrow(steam_super)
+```
+We still have 28,334 rows to work with.
+
+One relationship I want to examine with this data is the one between tags and owners. Obviously many popular games today are based around action, such as *Call of Duty*, but are there any outlier or hidden tags that might be associated with popular games? Are these tags good predictors of a successful game? Are there obvious ones?
+
+One way we can look at these relationships is by looking at the count of tags and the estimated owners. For each tag that a game has, a player has manually marked that tag in the Steam Store, a sort of player-governed categorization. The number of owners is estimated with a large range that is shown in the `owners` column. We can extract these tag count values and estimated owners to see if there is a relationship. Intuitively, as the number of owners increases, so should the count of tags. However, this may not be the case if only a small subset of players tag games, or if only certain players or moderators *can* tag games. This could be treated as a sanity check.
+
+```{r}
+#.f takes a list or character numbers and returns the maximum
+.f=function(l){max(as.numeric(l))}
+#Get the count of tags from all the tags column in steam_super
+tmp=str_extract_all(steam_super$tags,":[ ]*(\\d+)")
+#More filtering to get the counts
+t2=str_extract_all(tmp,"\\d+")
+#Extract the highest count from each
+bigs=sapply(t2,.f)
+```
+
+This first code chunk extracts the largest tag counts from each `tags` variable. Remember, the tags are stored as a character string listing the tag and its associated value. There isn't a great way to first extract all of these and have associated columns, so we may consider doing it as we go, perhaps trying to search for some particular value. In this case, we are doing that and looking for the maximum, without regard for what the name of that tag is.
+
+The following chunk addresses the owners problem. We must first extract the lower and upper bounds of the owners and then we can find a midpoint (after converting from character to numeric, of course). The ranges may seem ambiguously large in this set, but in reality SteamSpy does not keep track of exact owners (or if they do, its not part of the data they make public), but instead they group games by the approxiamate size of the owner group. For example, one group is 10,000,000-20,000,000. Any game that has a playerbase in that range is grouped into this category. In some ways this makes our data analysis easier, as we can just look at these groups.
+
+```{r}
+#Get the characters that represent the lower bound of possible owners
+lower=str_replace_all(str_extract(steam_super$owners,"[^.]+"),"[^0-9]","")
+#Get the upper bound
+upper=str_replace_all(str_extract(steam_super$owners,"[.][^.]+"),"[^0-9]","")
+#Convert the characters to numerics
+lower=as.numeric(lower)
+upper=as.numeric(upper)
+#Get the mids as an estimate
+mids=(lower+upper)/2
+```
+
+```{r}
+unique(mids)
+```
+
+As you can see, there are only 13 owner groupings. You might observe that we have `NA` values in our mids variable. This is because some games in the `steam_super` data frame have `NA` owners, so that trickles down to here. This isn't a huge problem yet, as the boxplot we'll be making (oops, spoilers) ignores NA values. We should keep this in mind for later.
+
+Next we create a data frame with our bigs and mids values, accounting for the seemigly logarithmic owner groups by taking the log of both the bigs and mids. This serves as a sort of normalization. Earlier we said that as playerbase increases, so should maximum tag count. However, we now know that owners is not a unique identifier with just some uncertainty, but a group identifier that seemingly scales logarithmically. Therefore we should amend our previous sanity check to something more like "as the playerbase increases logarithmically, the tag count should increase logarithmically". 
+
+Finally we'll create a pretty simple boxplot to test this.
+```{r}
+#Create a data frame with rows representing the estimated number of owners and the count of the most frequent tag on a game
+df=data.frame(lbigs=log10(bigs),lmids=log10(mids))
+
+#Shows the frequency of the most occurring tag (doesn't mention the tag) 
+boxplot(split(df$lbigs,round(df$lmids)), xlab="owners", ylab="Frequency of most occuring tag")
+```
+
+Success! It looks like our sanity check was correct. Although the relationship between playerbase and tag count doesn't seem to be quite linear, its pretty close. There are also some interesting observations we can make just from this one plot. There seem to be many more outliers in the smaller owner groups, this may be from a smaller sample size. Because we know that there are 13 (not including NA) unique groups, we also know that this graph is doing some interesting grouping, probably graphing 2-3 groups just due to size limitations. This could also affect the ranging. It seems that groups in the mid-upper playerbase sizes have larger ranges, but less outliers. This makes sense, as there are many popular games with dedicated fanbases, but not as many super-popular games. Of the very upper end there are probably much fewer games. For example, the highest `mid` value is
+```{r}
+#Remember we have to address the NA value using the flag to remove it
+max(mids, na.rm = T)
+```
+Which equates to 150,000,000. This is a huge amount and I would expect very few games to be in this and the lower-adjacent group. Of these games it seems there is very little range and few, if any, outliers. This could be because at that scale, few people are adding new tags and instead are adding to the ones that already exist.
+
+With all of this information in mind, there are many avenues we can take with our data analysis. Before moving on lets store the `mids` and `bigs` variables in our data frame, in case we need them later. Remember how we obtained these values was by using `sapply` on the column, which should give us a vector with the values in the same order as they were obtained from the original columns. This means we should be okay to just append the variables onto the data frame.
+
+```{r}
+#Append the mids and bigs sets to the data frame just in case they're helpful later
+steam_super$mids <- mids
+steam_super$bigtags <- bigs
+```
+
+Thinking ahead, one relationship we may want to explore is the association rule(s). Association rules are logical rules that tell us how variables relate to each other, and other measures of those relationships. For example, if you're grocery shopping and you want to buy cereal, you may also want milk for that cereal. This can be described by the rule `{Cereal} => {Milk}`. Note that these are not reflexive, and can be transitive. There can also be multiple values on the left side, but not the right as then you would just break it apart into multiple rules. The package `arules` is specifically created for this kind of analysis, and will aid us greatly. 
+
+However, we will not be diving head-first into this today. Today is more about broad overviews of the data we have and how we had to transform it to be able to use it.
+
+As a summary, in this step we:
+Went back over our project, what we did previously, and what we're doing here.
+Took a look at our data and discussed what certain interesting variables meant, and this will continue as we go and as is needed.
+Transformed part of our data to create a graphic that gave us much more insight into possible relationships, which could further be abstracted to hypothesis. 
+Had a sanity check to make sure that our data makes at least *some* sense.
+And, briefly went over possible hurdles in our future, such as `NA` values.
+
+For the next step we will look more at association rules and possibly other relationships we find along the way. This will involve working with the `arules` package as well as doing further transformations on our data. One difficulty will be analyzing tags. Abstracting the `tags` variable in each row to some other representation, such as a column for each tag and a value in each row that indicates the count of that tag, would be wonderful, but rather difficult and possibly cumbersome. After doing some preliminary work on this idea, I think it may be better to get the tags we need as we go, such as we did getting the maximum tag counts. If its interesting, some of that work will be left below, and pieces may be used later. In particular, there are some regular expressions that will help in extracting values and counts from the tags variables.
+
+```{r}
+save(steam_super, file="steam_super.rdata")
+```
+
+
+
+
+## Discarded work, from a more civilized age
+
+Now, if the `tags` column is going to be of any use to us, we need to convert it from its current form, which is just one long string of tags and values:
+```{r,eval=F}
+steam_super[1,"tags"]
+```
+
+into a matrix or nested list. This way we can use these values in conjunction with other columns to check for any correlations.
+
+One way to do this is to parse everything into a list and put that into a column. First, since we are going to use the `jsonlite` package to read the strings as JSON, we need to remove any " 's ", such as with the "1990's". This is because we are turning all apostrophes into double quotes, and the apostrophe in tags like this will create problems.
+```{r,eval=F}
+steam_super$tags <- str_replace_all(steam_super$tags, "'s", "s")
+steam_super[1,"tags"]
+```
+
+```{r,eval=F}
+SteamTagsToLists <- function(tags){
+  tags <- str_replace_all(tags, "'s", "s")
+  tags <- str_replace_all(tags, "'em ", "em")
+  tags <- str_replace_all(tags, "'Em ", "em")
+  tags <- fromJSON(chartr("'", '"', tags))
+  return(tags)
+}
+alpha <- function(){
+  for(row in 1:nrow(steam_super)){
+    steam_super[row, "tags.lists"] = SteamTagsToLists(steam_super[row, "tags"])
+  }
+}
+```
+
+```{r,eval=F}
+options(warn = -1)
+alpha()
+```
+
+
+
+```{r, eval=F}
+`%+=%` = function(e1,e2) eval.parent(substitute(e1 <- e1 + e2))
+
+ExtractTags <- function(){
+  tmp <- data.frame(tags, counts)
+  for(row in 1:nrow(steam_super)){
+    tags <- as.vector(str_extract_all(steam_super[row, "tags"], "[a-zA-Z- ]{2,}|[0-9]+[']*s", simplify = TRUE))
+    counts <- as.vector(as.integer(str_extract_all(str_extract_all(steam_super[row, "tags"], "[0-9]+[,}]+", simplify = T), "[0-9]+", simplify = T)))
+    tdf <- data.frame(tags, counts)
+    for(tag in tdf$tags){
+      if(!(tag %in% tmp$tags)){
+        tmp %>% add_row(tags = tag, counts = as.integer(tdf[tdf$tags==tag, "counts"]))
+      } else {
+        tmp[tmp$tags==tag, "counts"] %+=% as.integer(tdf[tdf$tags==tag, "counts"])
+      }
+    }
+  }
+  return(tmp)
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
